@@ -88,7 +88,7 @@ class ViT(nn.Module):
 ### 2. 数据集准备（CIFAR-10）
 
 transform = transforms.Compose([
-    transforms.Resize(32,32),
+    transforms.Resize((32,32)),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
@@ -292,3 +292,107 @@ def update_plots(epoch, train_losses, val_accuracies, lr_history, model, test_sa
                 features.append(x[:, 0].cpu())
                 labels_list.append(labels)
 
+            features = torch.cat(features, dim=0).numpy() # 合并特征
+            labels_list = torch.cat(labels_list, dim=0).numpy() # 合并标签
+
+            #    t-SNE降维
+            tsne = TSNE(n_components=2, random_state=42)
+            features_2d = tsne.fit_transform(features)
+
+            #    绘制t-SNE图
+            ax7.axis('on')
+            scatter = ax7.scatter(features_2d[:, 0], features_2d[:, 1], c=labels_list, cmap='tab10', alpha=0.6)
+            ax7.legend(handles=scatter.legend_elements()[0], labels=classes, title="Classes", loc='best')
+
+    plt.tight_layout() # 自动调整子图间距
+    display.clear_output(wait=True) # 清除输出
+    display.display(plt.gcf()) # 显示图表
+    time.sleep(0.1) # 短暂延时以便更新图表
+
+# 4. 训练配置
+model = ViT(image_size=32, patch_size=4, num_classes=10, dim=128, depth=6, heads=8, mlp_dim=256).to(device)
+
+criterion = nn.CrossEntropyLoss() # 损失函数
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4) # 优化器
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20) # 学习率衰减
+
+# 初始化可视化
+fig = setup_plots()
+test_sample, _ = next(iter(test_loader)) # 获取一个测试样本用于可视化
+test_sample = test_sample[0] # 只取第一张图片
+
+# 记录训练过程
+train_losses = []
+val_accuracies = []
+lr_history = []
+
+# 5. 训练模型
+def train(epoch):
+    model.train() # 训练模式
+    total_loss = 0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        
+        optimizer.zero_grad() # 清空梯度
+        outputs = model(images) # 前向传播
+        loss = criterion(outputs, labels) # 计算损失
+        loss.backward() # 反向传播
+        optimizer.step() # 更新参数
+
+        total_loss += loss.item() * images.size(0) # 累计损失
+
+    scheduler.step() # 更新学习率
+    avg_loss = total_loss / len(train_loader)
+    train_losses.append(avg_loss)
+    lr_history.append(optimizer.param_groups[0]['lr']) # 记录学习率
+    return avg_loss
+
+# 6. 测试模型
+def test(epoch):
+    model.eval() # 评估模式
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    val_accuracies.append(accuracy)
+    return accuracy
+
+# 7. 训练循环
+num_epochs = 30
+best_accuracy = 0
+
+print("Start training with real-time visualization...")
+for epoch in range(1, num_epochs+1):
+    start_time = time.time()
+
+    train_loss = train(epoch) # 训练
+    test_acc = test(epoch)
+
+    # 更新图表
+    update_plots(epoch, train_losses, val_accuracies, lr_history, model, test_sample)
+
+    # 打印训练信息
+    epoch_time = time.time() - start_time
+    print(f"Epoch [{epoch}/{num_epochs}], "
+          f"Loss: {train_loss:.4f}, "
+          f"Accuracy: {test_acc:.2f}%, "
+          f"Time: {epoch_time:.2f}s,"
+          f"LR: {lr_history[-1]:.6f}")
+    
+    # 保存最佳模型
+    if test_acc > best_accuracy:
+        best_accuracy = test_acc
+        torch.save(model.state_dict(), 'best_model.pth')
+        print(f"Best model saved with accuracy: {best_accuracy:.2f}%")
+
+print(f"Training complete! Best accuracy: {best_accuracy:.2f}%")
+plt.show() # 显示图表
