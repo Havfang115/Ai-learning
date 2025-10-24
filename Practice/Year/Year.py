@@ -13,4 +13,8 @@ daily_bikes = daily_bikes.transpose(1, 2)
 first_day = bikes[:24].long() 
 weather_onehot = torch.zeros(first_day.shape[0], 4) 
 daily_weather_onehot = torch.zeros(daily_bikes.shape[0], 4, daily_bikes.shape[2])
-daily_weather_onehot.scatter_(1, daily_bikes[:,9,:].long().unsqueeze(1) - 1, 1.0) 
+daily_weather_onehot.scatter_(1, daily_bikes[:,9,:].long().unsqueeze(1) - 1, 1.0)
+daily_bikes = torch.cat((daily_bikes, daily_weather_onehot), dim=1)
+daily_bikes[:, 9, :] = (daily_bikes[:, 9, :] - 1.0) / 3.0
+temp = daily_bikes[:, 10, :] 
+daily_bikes[:, 10, :] = (daily_bikes[:, 10, :] - torch.mean(temp)) / torch.std(temp)
