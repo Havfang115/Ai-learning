@@ -163,17 +163,22 @@ class Attention(nn.Module):
         output = self.resid_dropout(output)
         return output
     
+
+### 测试代码
+
 args = ModelConfig()
-# 测试代码
+
 attention = Attention(args)
 
-# 模拟输入数据
+# 定义批次大小、序列长度和维度
 batch_size = 1
 seq_len = 50
 dim = args.dim
+# 定义输入张量
 x = torch.randn(batch_size, seq_len, dim) # 输入张量
 freqs_cos, freqs_sin = precompute_freqs_cis(dim // args.n_heads, seq_len)
 output = attention(x, freqs_cos, freqs_sin)
+
 print("Attention output shape:", output.shape)  # 应该是 (1, 50, dim)
 
 
