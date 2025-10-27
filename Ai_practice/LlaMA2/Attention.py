@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 from typing import Tuple
 from Model_Config import ModelConfig
 
@@ -74,4 +76,104 @@ def apply_rotary_emb(
 class Attention(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
+        # 根据是否指定n_kv_heads来设置键值对注意力头的数量
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # 确保注意力头的数量可以被键值对注意力头的数量整除
+        assert args.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+
+        # 模型并行大小
+        model_parallel_size = 1
+        # 本地计算头数，等于总头数除以模型并行大小
+        self.n_local_heads = args.n_heads // model_parallel_size
+        # 本地键值头数，等于键值对头数除以模型并行大小
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        # 重复次数，等于本地计算头数除以本地键值头数，用于扩展键值对张量
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 每个头维度， 等于模型维度除以总头数
+        self.head_dim = args.dim // args.n_heads
+
+        # 定义权重矩阵
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        # 定义输出矩阵
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        # 定义dropout层
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        # 保存dropout概率
+        self.dropout = args.dropout
+
+        # 检查是否使用Flash Attention
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
+        if not self.flash:
+            # 无法使用FA则手动实现注意力机制并设置mask
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1) # 上三角矩阵
+            # 注册缓冲区以保存mask
+            self.register_buffer("mask", mask)
+
+    # 定义前向传播函数
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
+        # 获取批次大小和序列长度，【batch_size, seq_len, dim】
+        bsz, seqlen, _ = x.shape
+        
+        # 计算查询、键、值张量
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) 
+        # 调整形状以适应头的维度
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # 应用旋转嵌入(RoPE)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        
+        # 重复键值对张量以匹配查询张量的头数
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
+
+        # 将头作为批次维度的一部分进行处理
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 根据是否支持Flash Attention选择计算方法
+        if self.flash:
+            # 使用Flash Attention
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None, 
+                dropout_p=self.dropout if self.training else 0.0, 
+                is_causal=True
+            )
+        else:
+            # 手动实现注意力机制
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            assert hasattr(self, "mask")
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)
+        
+        # 恢复时间维度并合并头
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        # 投影回残差连接维度
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
+    
+args = ModelConfig()
+# 测试代码
+attention = Attention(args)
+
+# 模拟输入数据
+batch_size = 1
+seq_len = 50
+dim = args.dim
+x = torch.randn(batch_size, seq_len, dim) # 输入张量
+freqs_cos, freqs_sin = precompute_freqs_cis(dim // args.n_heads, seq_len)
+output = attention(x, freqs_cos, freqs_sin)
+print("Attention output shape:", output.shape)  # 应该是 (1, 50, dim)
+
 
