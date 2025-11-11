@@ -11,6 +11,3 @@ from tokenizers import (
 )
 from tokenizers.normalizers import NFKC
 from typing import Generator
-
-def eval_tokenizer(tokenizer_path: str) -> None:
-    # 
