@@ -1,0 +1,134 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datetime import datetime
+import time
+
+# --- CONFIGURATION ---
+# Using Phi-3.5-mini because it is efficient and has a large context window (128k)
+# capable of holding weeks of conversation in memory without a database.
+MODEL_ID = "microsoft/Phi-3.5-mini-instruct" 
+
+class TimeAwareMemory:
+    def __init__(self):
+        self.history = []
+        self.last_interaction_time = None
+
+    def get_current_timestamp(self):
+        return datetime.now()
+
+    def format_time_metadata(self):
+        """
+        Creates the compact 'Internal Timestamp' + 'Relative Time' string.
+        Format: [T:YYMMDD-HHMM | +Xm since last]
+        """
+        now = self.get_current_timestamp()
+        time_str = now.strftime("%y%m%d-%H%M") # Compact date format
+        
+        if self.last_interaction_time is None:
+            # First message ever
+            relative_str = "Session Start"
+        else:
+            # Calculate time difference
+            delta = now - self.last_interaction_time
+            minutes = int(delta.total_seconds() / 60)
+            hours = int(minutes / 60)
+            days = int(hours / 24)
+            
+            if days > 0:
+                relative_str = f"+{days}d since last"
+            elif hours > 0:
+                relative_str = f"+{hours}h since last"
+            else:
+                relative_str = f"+{minutes}m since last"
+
+        self.last_interaction_time = now
+        return f"[T:{time_str} | {relative_str}]"
+
+    def add_user_message(self, content):
+        # 1. Generate the Metadata
+        metadata = self.format_time_metadata()
+        
+        # 2. Wrap the user content (The "Prompt Sandwich")
+        # We explicitly label it as INTERNAL_META to help the LLM separate it.
+        full_content = f"{metadata} {content}"
+        
+        # 3. Add to history
+        self.history.append({"role": "user", "content": full_content})
+
+    def add_assistant_message(self, content):
+        self.history.append({"role": "assistant", "content": content})
+
+    def get_context_window(self):
+        """
+        Constructs the full prompt, including the Dynamic System Anchor.
+        """
+        # The System Anchor: Keeps the model grounded in the current moment
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+        system_prompt = (
+            f"Current Date: {current_date}.\n"
+            "You are a memory-augmented assistant. "
+            "Every user message starts with an internal tag: [T:Date-Time | Relative Gap]. "
+            "Use this to understand when events happened. "
+            "Never repeat the timestamp tag in your output."
+        )
+        
+        # We insert the system prompt at the very start of the message list
+        # Note: Phi-3 supports system prompts via specific formatting, 
+        # but for simplicity/universality, we prepend it to the context.
+        context_messages = [{"role": "system", "content": system_prompt}] + self.history
+        return context_messages
+
+def main():
+    print("Loading AI Model... (This may take a moment)")
+    
+    # Auto-detect hardware (GPU vs CPU)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on: {device.upper()}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, 
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto", 
+        trust_remote_code=True
+    )
+
+    memory = TimeAwareMemory()
+    print("\nSystem Ready! (Type 'quit' to exit)\n")
+
+    while True:
+        user_input = input("\nYou: ")
+        if user_input.lower() in ["quit", "exit"]:
+            break
+
+        # 1. Add User Input (with auto-timestamping)
+        memory.add_user_message(user_input)
+
+        # 2. Prepare Inputs for Model
+        messages = memory.get_context_window()
+        input_ids = tokenizer.apply_chat_template(
+            messages, 
+            add_generation_prompt=True, 
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 3. Generate Response
+        # We prevent the model from rambling by setting a max_new_tokens limit
+        outputs = model.generate(
+            input_ids, 
+            max_new_tokens=256, 
+            do_sample=True, 
+            temperature=0.7
+        )
+
+        # 4. Decode Output
+        # We slice [input_ids.shape[1]:] to only get the NEW text, not the prompt
+        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+
+        print(f"AI: {response}")
+
+        # 5. Save AI response to memory so it remembers what it said
+        memory.add_assistant_message(response)
+
+if __name__ == "__main__":
+    main()
